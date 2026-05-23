@@ -7,7 +7,7 @@ use std::io::{Error, ErrorKind, Result};
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Port number
@@ -22,15 +22,27 @@ struct Args {
     #[arg(short, long, default_value_t = String::from("no"))]
     whitelist: String,
 
+    /// Username for SOCKS5 Proxy (Optional)
+    #[arg(long)]
+    username: Option<String>,
+
+    /// Password for SOCKS5 Proxy (Optional)
+    #[arg(long)]
+    password: Option<String>,
 }
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     log_init("smolprox", "~/.cache/smolprox", !args.nolog);
-    println!("[ok] smolprox initializing");
+    println!("[ok] smolprox running");
+    println!("see logs for more info");
     
-
     log(Severity::DEBUG, "smolprox started");
+    if args.password.is_some() && args.username.is_none() {
+        panic!("password was defined but username was not");
+    } else if args.password.is_none() && args.username.is_some() {
+        panic!("username was defined but password was not");
+    }
     let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
     loop {
         let (socket, remote_addr) = listener.accept().await.unwrap();
@@ -39,8 +51,9 @@ async fn main() {
             log(Severity::WARNING, "Not whitelisted client tried to connect, silently dropped connection");
             continue;
         }
+        let args_clone = args.clone();
         tokio::spawn(async move {
-            if let Err(e) = process( socket).await {
+            if let Err(e) = process( socket, args_clone).await {
                 log(Severity::CRITICAL, &format!("Proxy error: {}", e));
             }
         });
@@ -48,16 +61,46 @@ async fn main() {
     }
 }
 
-async fn process_socks5(mut stream: TcpStream) -> Result<()> {
+async fn process_socks5(mut stream: TcpStream, args: Args) -> Result<()> {
     let mut initial_handshake = [0; 1024];
     stream.read(&mut initial_handshake).await?;
     let version = initial_handshake[0];
-    let num_methods = initial_handshake[1];
+    let num_methods = initial_handshake[1] as usize;
+    let methods = &initial_handshake[2..2 + num_methods];
     if version != 0x05 {
         return Err(Error::new(ErrorKind::InvalidData, "not socks5"));
     }
-    let response = [0x05, 0x00];
-    stream.write_all(&response).await?;
+    if methods.contains(&0x02) && args.username.is_some() {
+        let response = [0x05, 0x02];
+        stream.write_all(&response).await?;
+        let mut sub_header = [0x00; 0x02];
+        let auth_response = stream.read_exact(&mut sub_header).await?;
+        let user_len = sub_header[1] as usize;
+        let mut user_buf = vec![0x00; user_len];
+        stream.read_exact(&mut user_buf).await?;
+        let username = String::from_utf8_lossy(&user_buf);
+        let pass_len = stream.read_u8().await? as usize;
+        let mut pass_buf = vec![0x00; pass_len];
+        stream.read_exact(&mut pass_buf).await?;
+        let password = String::from_utf8_lossy(&pass_buf);
+        if username == *args.username.as_ref().unwrap() && password == *args.password.as_ref().unwrap() {
+            let succes_response = [0x01, 0x00];
+            stream.write_all(&succes_response).await?;
+            log(Severity::INFO, "Authentication succesful");
+        } else {
+            let fail_response = [0x01, 0x01];
+            stream.write_all(&fail_response).await?;
+            return Err(Error::new(ErrorKind::PermissionDenied, "Client authentication failed"))
+        }
+    } else if methods.contains(&0x00) && args.username.is_none() {
+        let response = [0x05, 0x00];
+        stream.write_all(&response).await?;
+    } else  {
+        let response = [0x05, 0xFF];    
+        stream.write_all(&response).await?;
+        return Err(Error::new(ErrorKind::InvalidData, "Client does not have the required authentication method"))
+    }
+    
     let mut header = [0; 4];
     stream.read_exact(&mut header).await?;
     let atyp = header[3];
@@ -97,6 +140,7 @@ async fn process_socks5(mut stream: TcpStream) -> Result<()> {
             return Err(Error::new(ErrorKind::HostUnreachable, format!("Could not reach host: {}", e)))
         }
     };
+    log(Severity::DEBUG, "Succesfully established connection with target, tunnel handoff");
     let success_response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     stream.write_all(&success_response).await?;
     let (mut client_reader, mut client_writer) = stream.into_split();
@@ -109,13 +153,13 @@ async fn process_socks5(mut stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn process(mut stream: TcpStream) -> Result<()>{
+async fn process(mut stream: TcpStream, args: Args) -> Result<()>{
     let mut peek_buf = [0; 1];
     let _ = stream.peek(&mut peek_buf).await?;
     let first_byte = peek_buf[0];
     if first_byte == 0x05 {
         log(Severity::INFO, "detected socks5");
-        return process_socks5(stream).await;
+        return process_socks5(stream, args).await;
     }
 
     let mut buffer = [0; 1024];
@@ -149,6 +193,7 @@ async fn process(mut stream: TcpStream) -> Result<()>{
             return Err(e);
         }
     };
+    log(Severity::DEBUG, "Succesfully established connection with target, tunnel handoff");
     let connected_response = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: smolprox/1.0\r\n\r\n";
     stream.write_all(connected_response.as_bytes()).await?;
     let (mut client_reader, mut client_writer) = stream.into_split();
