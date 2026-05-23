@@ -15,7 +15,9 @@ async fn main() {
     loop {
         let (socket, _) = listener.accept().await.unwrap();
         tokio::spawn(async move {
-            process( socket).await;
+            if let Err(e) = process( socket).await {
+                log(Severity::CRITICAL, &format!("Proxy error: {}", e));
+            }
         });
         
     }
