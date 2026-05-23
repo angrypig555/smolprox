@@ -4,16 +4,40 @@ use log_overflow::{log, log_init, Severity};
 use tokio::io::copy;
 use tokio::io::AsyncWriteExt;
 use std::io::{Error, ErrorKind, Result};
+use clap::Parser;
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Port number
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
 
+    /// Turn off logging
+    #[arg(short, long)]
+    nolog: bool,
+
+    /// Whitelist an IP
+    #[arg(short, long, default_value_t = String::from("no"))]
+    whitelist: String,
+
+}
 #[tokio::main]
 async fn main() {
-    log_init("smolprox", "~/.cache/smolprox", true);
+    let args = Args::parse();
+    log_init("smolprox", "~/.cache/smolprox", !args.nolog);
     println!("[ok] smolprox initializing");
+    
+
     log(Severity::DEBUG, "smolprox started");
     let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
     loop {
-        let (socket, _) = listener.accept().await.unwrap();
+        let (socket, remote_addr) = listener.accept().await.unwrap();
+        let client_ip = remote_addr.ip().to_string();
+        if args.whitelist != "no" && client_ip != args.whitelist {
+            log(Severity::WARNING, "Not whitelisted client tried to connect, silently dropped connection");
+            continue;
+        }
         tokio::spawn(async move {
             if let Err(e) = process( socket).await {
                 log(Severity::CRITICAL, &format!("Proxy error: {}", e));
