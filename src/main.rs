@@ -5,6 +5,7 @@ use tokio::io::copy;
 use tokio::io::AsyncWriteExt;
 use std::io::{Error, ErrorKind, Result};
 use clap::Parser;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -47,7 +48,76 @@ async fn main() {
     }
 }
 
+async fn process_socks5(mut stream: TcpStream) -> Result<()> {
+    let mut initial_handshake = [0; 1024];
+    stream.read(&mut initial_handshake).await?;
+    let version = initial_handshake[0];
+    let num_methods = initial_handshake[1];
+    if version != 0x05 {
+        return Err(Error::new(ErrorKind::InvalidData, "not socks5"));
+    }
+    let response = [0x05, 0x00];
+    stream.write_all(&response).await?;
+    let mut header = [0; 4];
+    stream.read_exact(&mut header).await?;
+    let atyp = header[3];
+    let target: String = match atyp {
+        0x01 => {
+            let mut buf = [0; 6];
+            stream.read_exact(&mut buf).await?;
+            let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+            let port = u16::from_be_bytes([buf[4], buf[5]]);
+            format!("{}:{}", ip, port)
+        }
+        0x03 => {
+            let len = stream.read_u8().await? as usize;
+            let mut buf = vec![0; len + 2];
+            stream.read_exact(&mut buf).await?;
+            let domain = String::from_utf8_lossy(&buf[..len]);
+            let port = u16::from_be_bytes([buf[len], buf[len + 1]]);
+            format!("{}:{}", domain, port)
+        }
+        0x04 => {
+            let mut buf = [0; 18];
+            stream.read_exact(&mut buf).await?;
+            let mut ipv6_bytes = [0; 16];
+            ipv6_bytes.copy_from_slice(&buf[..16]);
+            let ip = Ipv6Addr::from(ipv6_bytes);
+            //let ip = Ipv6Addr::new(buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16]);
+            let port = u16::from_be_bytes([buf[17], buf[18]]);
+            format!("{}:{}", ip, port)
+        }
+        _ => return Err(Error::new(ErrorKind::InvalidData, "Invalid Target address for SOCKS5"))
+    };
+    let mut target_stream = match TcpStream::connect(target).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            let response = [0x05, 0x04, 0x00];
+            stream.write_all(&response).await?;
+            return Err(Error::new(ErrorKind::HostUnreachable, format!("Could not reach host: {}", e)))
+        }
+    };
+    let success_response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    stream.write_all(&success_response).await?;
+    let (mut client_reader, mut client_writer) = stream.into_split();
+    let (mut target_reader, mut target_writer) = target_stream.into_split();
+    let client_to_target = tokio::spawn(async move {
+        let _ = copy(&mut client_reader, &mut target_writer).await;
+    });
+    let _ = copy(&mut target_reader, &mut client_writer).await;
+    let _ = client_to_target.await;
+    Ok(())
+}
+
 async fn process(mut stream: TcpStream) -> Result<()>{
+    let mut peek_buf = [0; 1];
+    let _ = stream.peek(&mut peek_buf).await?;
+    let first_byte = peek_buf[0];
+    if first_byte == 0x05 {
+        log(Severity::INFO, "detected socks5");
+        return process_socks5(stream).await;
+    }
+
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer).await?;
     let request = String::from_utf8_lossy(&buffer[..n]);
@@ -84,7 +154,7 @@ async fn process(mut stream: TcpStream) -> Result<()>{
     let (mut client_reader, mut client_writer) = stream.into_split();
     let (mut target_reader, mut target_writer) = target_stream.into_split();
     let client_to_target = tokio::spawn(async move {
-    let _ = copy(&mut client_reader, &mut target_writer).await;
+        let _ = copy(&mut client_reader, &mut target_writer).await;
     });
     let _ = copy(&mut target_reader, &mut client_writer).await;
     let _ = client_to_target.await;
