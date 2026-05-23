@@ -29,6 +29,14 @@ struct Args {
     /// Password for SOCKS5 Proxy (Optional)
     #[arg(long)]
     password: Option<String>,
+
+    /// Disable SOCKS5 Proxy
+    #[arg(long, default_value_t = false)]
+    nosocks: bool,
+
+    /// Disable HTTP Proxy
+    #[arg(long, default_value_t = false)]
+    nohttp: bool,
 }
 #[tokio::main]
 async fn main() {
@@ -42,6 +50,9 @@ async fn main() {
         panic!("password was defined but username was not");
     } else if args.password.is_none() && args.username.is_some() {
         panic!("username was defined but password was not");
+    }
+    if args.nohttp && args.nosocks {
+        panic!("http and SOCKS5 is both disabled, unable to run");
     }
     let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
     loop {
@@ -158,10 +169,15 @@ async fn process(mut stream: TcpStream, args: Args) -> Result<()>{
     let _ = stream.peek(&mut peek_buf).await?;
     let first_byte = peek_buf[0];
     if first_byte == 0x05 {
+        if args.nosocks {
+            return Err(Error::new(ErrorKind::Unsupported, "Attempted to connect via SOCKS5 when only HTTP is available"))
+        }
         log(Severity::INFO, "detected socks5");
         return process_socks5(stream, args).await;
     }
-
+    if args.nohttp {
+        return Err(Error::new(ErrorKind::Unsupported, "Attempted to connect via HTTP when only SOCKS5 is available"))
+    }
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer).await?;
     let request = String::from_utf8_lossy(&buffer[..n]);
